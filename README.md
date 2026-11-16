@@ -87,7 +87,7 @@ python paintfe_mcp_test.py
 To specify the executable path explicitly:
 
 ```bash
-python paintfe_mcp_test.py --command "C:\Program Files\PaintFE\PaintFE.exe" --arg --mcp
+python paintfe_mcp_test.py --command "C:\Program Files\PaintFE\PaintFE.exe" --arg="--mcp"
 ```
 
 The script launches `PaintFE.exe --mcp` as a child process. This starts a new PaintFE instance in MCP mode, and the GUI window is not opened in this mode. If you do not see PaintFE under the Task Manager **Apps** section, check the **Details** tab instead — the process will appear there using the PID printed by the script.
