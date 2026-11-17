@@ -23,9 +23,6 @@ __pycache__/
 # a negated file pattern cannot re-include a file inside an ignored folder.
 # ---------------------------------------------------------------------------
 input/*
-output/*
-!output/dog.pfe
-!output/dog_minimax_31flash.png
 logs/
 _INFO/
 _preview/

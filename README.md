@@ -2,7 +2,7 @@
 
 This repository shows how to use PaintFE as a local MCP server. PaintFE is a graphics editor that can accept commands from an external AI client through the Model Context Protocol (MCP).
 
-![Dog as drawn by MiniMax 3.1 Flash](output/dog_minimax_31flash.png)
+![Dog as drawn by MiniMax 3.1 Flash](output/dog_minimax_31flash.png) ![Dog as drawn by DeepSeek 4.1 Flash](output/dog_deepseek_41flash.png)
 
 ## What MCP means in PaintFE
 
@@ -98,7 +98,23 @@ The script launches `PaintFE.exe --mcp` as a child process. In this mode, the ap
 
 ## Drawing a dog 256x256 image by AI models
 
-The only good result I've received so far is the one below, made by MiniMax 3.1 Flash (18M tokens spent (17.6 cached), took about 3 hours). Other models tested (DeepSeek 4.1 Flash, Qwen 3.8 Flash, GLM 5.3 Flash, ChatGPT 6 Luna) all gave results that were far from good (but they spent way less time and tockens) -- resuls are present in [output\dog.pfe](output\dog.pfe) file.
+### Prompt
+
+Create a new script based on this script that draws a dog on a 256×256 pixel image in PaintFE. You must render every pixel of the drawing, filling the empty areas inside all shapes with the appropriate colors.
+Do not read other Python .py files or .png files in the directory.
+
+### Test results
+
+The only good result I've received so far:
+
+- made by DeepSeek 4.1 Flash (1.7M tokens spent (1.6 cached), took about 15 minutes)
+- made by MiniMax 3.1 Flash (18M tokens spent (17.6 cached), took about 3 hours)
+
+Other models tested (Qwen 3.8 Flash, GLM 5.3 Flash, ChatGPT 6 Luna) all gave results that were far from good (but they spent way less time and tockens) -- resuls are present in [output\dog.pfe](output\dog.pfe) file.
+
+### DeepSeek 4.1 Flash
+
+![Dog as drawn by DeepSeek 4.1 Flash](output/dog_deepseek_41flash.png)
 
 ### MiniMax 3.1 Flash
 
