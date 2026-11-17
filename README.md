@@ -1,18 +1,18 @@
 # MCP PaintFE
 
-This project is intended for working with PaintFE as a local MCP server. PaintFE is a graphics editor that can accept commands from an external AI client through the Model Context Protocol (MCP).
+This repository shows how to use PaintFE as a local MCP server. PaintFE is a graphics editor that can accept commands from an external AI client through the Model Context Protocol (MCP).
 
-## What is MCP in PaintFE?
+## What MCP means in PaintFE
 
-PaintFE can act as a local MCP server for an external agent. The protocol uses standard JSON-RPC over stdin/stdout. This is a local stdio server, not an HTTP service.
+PaintFE can expose a local MCP server for an external agent. The protocol uses JSON-RPC over stdio (stdin/stdout), so this is a local stdio server rather than an HTTP service.
 
-Key features:
+Key points:
 
-- PaintFE runs as a regular executable with the `--mcp` flag
-- the connection must come from a local MCP client running in the same environment
-- the PaintFE GUI must remain open and active
-- local AI clients can inspect document previews, but PaintFE itself does not make network requests to models
-- before editing, you must first fetch the current `document`, `layer`, and `revision`
+- PaintFE runs as a regular executable with the `--mcp` flag.
+- The client must run locally and connect from the same environment.
+- The PaintFE GUI must remain open and active while the connection is live.
+- Local AI clients can inspect document previews, but PaintFE itself does not make network requests to models unless the client chooses to do so.
+- Before any edit, fetch the current `document`, `layer`, and `revision` values.
 
 ## Connection setup
 
@@ -39,7 +39,7 @@ Example client configuration:
 
 PaintFE supports tools such as:
 
-- `documents` — lists open documents, layers, and revisions
+- `documents` — lists open documents, their layers, and current revisions
 - `preview` — returns a bounded PNG preview of the document
 - `job_status` — reports the status of the current asynchronous operation
 - `cancel` — cancels a pending task
@@ -57,51 +57,51 @@ PaintFE supports tools such as:
 
 Before editing, keep the following in mind:
 
-- do not use stale `revision` values — after any change, refresh the identifiers
+- never reuse stale `revision` values; refresh them after each change
 - editing works only with supported raster layers
-- the active layer must be an 8-bit raster layer
+- the active layer should be an 8-bit raster layer
 - masks and text layers cannot be edited through this toolset
 - each completed drawing operation counts as a separate undo entry
 - after launching an asynchronous operation, always wait for `job_status`
 
-## Workflow
+## Typical workflow
 
-A typical flow is:
+A standard workflow is:
 
-1. Connect to PaintFE over MCP
-2. Call `documents`
-3. Obtain the current `document`, `layer`, and `revision`
-4. Run `stroke`, `shape`, `layer_opacity`, and similar calls
-5. Wait for `job_status`
-6. Refresh document state and continue with the next operation
-7. Save the result manually in PaintFE
+1. Connect to PaintFE over MCP.
+2. Call `documents`.
+3. Read the current `document`, `layer`, and `revision` values.
+4. Run `stroke`, `shape`, `layer_opacity`, and similar calls.
+5. Wait for `job_status`.
+6. Refresh document state and continue with the next operation.
+7. Save the result manually in PaintFE.
 
 ## Example connection check
 
-This project includes a Python script to verify the MCP connection and draw test points:
+This project includes a Python script that verifies the MCP connection and draws test points:
 
 ```bash
 python paintfe_mcp_test.py
 ```
 
-To specify the executable path explicitly:
+To point the script at a specific PaintFE installation:
 
 ```bash
-python paintfe_mcp_test.py --command "C:\Program Files\PaintFE\PaintFE.exe" --arg="--mcp"
+python paintfe_mcp_test.py --paintfe "C:\Program Files\PaintFE\PaintFE.exe"
 ```
 
-The script launches `PaintFE.exe --mcp` as a child process. This starts a new PaintFE instance in MCP mode, and the GUI window is not opened in this mode. If you do not see PaintFE under the Task Manager **Apps** section, check the **Details** tab instead — the process will appear there using the PID printed by the script.
+The script launches `PaintFE.exe --mcp` as a child process. In this mode, the application runs headless and does not open a GUI window. If you do not see PaintFE under the Task Manager **Apps** section, check the **Details** tab instead; the process will appear there with the PID printed by the script.
 
-> Important: PaintFE in `--mcp` mode does not respond to JSON-RPC requests until Local agent connections are enabled in the settings. If the script times out after "Sending initialize handshake to MCP server", open PaintFE manually, go to Preferences > AI, enable Local agent connections, and then restart the script.
+> Important: PaintFE in `--mcp` mode does not respond to JSON-RPC requests until Local agent connections are enabled in Preferences > AI. If the script times out after "Sending initialize handshake to MCP server", open PaintFE manually, go to Preferences > AI, enable Local agent connections, and then rerun the script.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| "PaintFE process is running" followed by a timeout | Local agent connections are disabled | Enable Local agent connections in Preferences > AI |
-| The process is not visible in the Task Manager Apps list | PaintFE is running headless in `--mcp` mode | Check the Details tab by PID from the script output |
-| `PaintFE executable not found` | Incorrect EXE path | Pass `--command` or fix `DEFAULT_CONFIG` |
-| `stale revision` error | IDs are outdated after a change | Call `documents` again and fetch the fresh values |
+| Timeout after the handshake begins | Local agent connections are disabled | Enable Local agent connections in Preferences > AI |
+| The process is not visible in the Task Manager Apps list | PaintFE is running headless in `--mcp` mode | Check the Details tab using the PID shown by the script |
+| `PaintFE executable not found` | Incorrect EXE path | Pass `--paintfe` with the correct path or update the default value |
+| `stale revision` error | The IDs are outdated after a change | Call `documents` again and fetch the fresh values |
 
 ## Useful project links
 
@@ -110,4 +110,4 @@ The script launches `PaintFE.exe --mcp` as a child process. This starts a new Pa
 
 ## Note
 
-This project does not automatically connect PaintFE to external AI services. All data stays local; if a remote model provider is used, its client may receive document previews, but PaintFE itself does not upload the document without your choice of client.
+This project does not automatically connect PaintFE to external AI services. All data stays local. If a remote model provider is used, its client may receive document previews, but PaintFE itself does not upload the document unless the user chooses to do so.

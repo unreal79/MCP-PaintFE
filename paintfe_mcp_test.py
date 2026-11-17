@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect PaintFE over MCP stdio, or draw three dots with --draw.
+"""Inspect PaintFE over MCP stdio, and draw three dots with --draw.
 
 Uses only Python's standard library. Open the desktop editor separately first.
 Based on mcp_client.py (https://github.com/kylejckson/PaintFE/blob/main/examples/mcp_client.py)
@@ -17,6 +17,7 @@ import time
 
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
+DEFAULT_PAINTFE_PATH = r"C:\Program Files\PaintFE\PaintFE.exe"
 
 
 class RunLog:
@@ -262,8 +263,9 @@ def draw_three_dots(client, document):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--paintfe", required=True, type=Path, help="Path to the PaintFE executable")
-    parser.add_argument("--draw", action="store_true", help="Create a layer and draw three test dots")
+    parser.add_argument("--paintfe", default=DEFAULT_PAINTFE_PATH, type=Path, help=f"Path to the PaintFE executable (default: {DEFAULT_PAINTFE_PATH})")
+    parser.add_argument("--draw", dest="draw", action="store_true", default=True, help="Create a layer and draw three test dots (default)")
+    parser.add_argument("--no-draw", dest="draw", action="store_false", help="Skip drawing and only inspect the document")
     parser.add_argument("--timeout", type=float, default=20, help="Response timeout in seconds (default: 20)")
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or not 0 < args.timeout <= 120:
