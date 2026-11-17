@@ -1,51 +1,26 @@
 #!/usr/bin/env python3
-"""Minimal MCP client for PaintFE.
+"""Inspect PaintFE over MCP stdio, or draw three dots with --draw.
 
-It connects to PaintFE over stdio using the MCP JSON-RPC protocol, checks the
-handshake, lists available tools, then draws three colored points on the active
-raster layer.
-
-Example config:
-{
-  "mcpServers": {
-    "paintfe": {
-      "command": "C:\\Program Files\\PaintFE\\PaintFE.exe",
-      "args": ["--mcp"]
-    }
-  }
-}
+Uses only Python's standard library. Open the desktop editor separately first.
+Based on mcp_client.py (https://github.com/kylejckson/PaintFE/blob/main/examples/mcp_client.py)
 """
-
-from __future__ import annotations
-
 import argparse
+from collections import deque
+from datetime import datetime
 import json
-import os
-import queue as _queue
-import shutil
+import math
+from pathlib import Path
+import queue
 import subprocess
-import sys
 import threading
 import time
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-WORKSPACE = Path(__file__).resolve().parent
-LOG_DIR = WORKSPACE / "logs"
-TIMEOUT = 5.0 # Default timeout for PaintFE startup in seconds
-DEFAULT_CONFIG = {
-    "mcpServers": {
-        "paintfe": {
-            "command": "C:\\Program Files\\PaintFE\\PaintFE.exe",
-            "args": ["--mcp"],
-        }
-    }
-}
+
+LOG_DIR = Path(__file__).resolve().parent / "logs"
 
 
 class RunLog:
-    """One log file per run, mirroring the helper used in the Rigby2D MCP utilities."""
+    """One log file per run, mirroring the helper used in the PaintFE MCP probe."""
 
     def __init__(self, folder: Path = LOG_DIR, prefix: str = "run") -> None:
         folder.mkdir(parents=True, exist_ok=True)
@@ -65,519 +40,256 @@ class RunLog:
 
     def info(self, message: str) -> None:
         self._write("INFO", message)
-        print(message)
-        sys.stdout.flush()
 
     def detail(self, message: str) -> None:
         self._write("INFO", message)
 
     def warning(self, message: str) -> None:
         self._write("WARN", message)
-        print(message, file=sys.stderr)
-        sys.stderr.flush()
 
     def error(self, message: str) -> None:
         self._write("ERROR", message)
-        print(message, file=sys.stderr)
-        sys.stderr.flush()
 
     def close(self) -> None:
         self._file.close()
 
-    def __enter__(self) -> "RunLog":
+    def __enter__(self):
         return self
 
     def __exit__(self, *exc_info) -> None:
         self.close()
 
 
-class PaintFEMCPError(RuntimeError):
-    """Raised when the MCP connection or a PaintFE tool call fails."""
+class MCPError(RuntimeError):
+    """A connection, protocol or tool execution error."""
 
 
-class MCPStdioClient:
-    def __init__(self, command: str, args: Optional[Sequence[str]] = None, log: Optional[RunLog] = None, startup_timeout: float = TIMEOUT):
-        self.command = command
-        self.args = list(args or [])
-        self.process: Optional[subprocess.Popen[bytes]] = None
-        self.next_id = 1
-        self.stderr_lines: List[str] = []
-        self._stderr_lock = threading.Lock()
-        self._message_queue: "_queue.Queue[Any]" = _queue.Queue()
+class Client:
+    def __init__(self, command, args=("--mcp",), timeout=20, log: RunLog | None = None):
+        self.timeout = timeout
+        self.next_id = 0
+        self.messages = queue.Queue()
+        self.errors = deque(maxlen=16)
         self.log = log
-        self.startup_timeout = startup_timeout
-
-    def start(self) -> None:
-        if not self.command:
-            raise PaintFEMCPError("PaintFE command is empty.")
-
-        resolved = self.command
-        if not os.path.exists(resolved):
-            found = shutil.which(resolved)
-            if found:
-                resolved = found
-            else:
-                raise PaintFEMCPError(f"PaintFE executable not found: {self.command}")
-
-        self.command = resolved
         self.process = subprocess.Popen(
-            [self.command, *self.args],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            [str(command), *args], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
 
-        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
-        self._stderr_thread.start()
-        self._stdout_thread = threading.Thread(target=self._pump_stdout, daemon=True)
-        self._stdout_thread.start()
-        self.wait_for_startup(self.startup_timeout)
-
-    def wait_for_startup(self, timeout_seconds: float = TIMEOUT) -> None:
-        if self.process is None:
-            raise PaintFEMCPError("PaintFE process was not created.")
-
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            exit_code = self.process.poll()
-            if exit_code is not None:
-                stderr_text = "\n".join(self.stderr_lines[-20:])
-                raise PaintFEMCPError(
-                    f"PaintFE exited before the MCP server became ready. "
-                    f"Exit code: {exit_code}. "
-                    f"Check that PaintFE is installed and that the command is valid: "
-                    f"{self.command} {' '.join(self.args)}. "
-                    f"stderr: {stderr_text or 'no stderr output'}"
-                )
-            time.sleep(0.2)
-
-        if self.process.poll() is None:
-            if self.log:
-                self.log.info(f"PaintFE process is running (PID {self.process.pid})")
-            return
-
-        stderr_text = "\n".join(self.stderr_lines[-20:])
-        raise PaintFEMCPError(
-            f"PaintFE did not start within {timeout_seconds} seconds. "
-            f"Make sure the window is open, the app is installed, and the local AI connection is enabled. "
-            f"stderr: {stderr_text or 'no stderr output'}"
-        )
-
-    def _read_stderr(self) -> None:
-        if self.process is None or self.process.stderr is None:
-            return
-
-        while True:
-            line = self.process.stderr.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace").rstrip()
-            if text:
-                with self._stderr_lock:
-                    self.stderr_lines.append(text)
-
-    def _pump_stdout(self) -> None:
-        """Parse complete MCP messages from stdout and push them onto the queue."""
-        if self.process is None or self.process.stdout is None:
-            return
+    def _read_stdout(self):
         try:
             while True:
-                header_lines: List[bytes] = []
-                while True:
-                    line = self.process.stdout.readline()
-                    if not line:
-                        self._message_queue.put(PaintFEMCPError("PaintFE closed the MCP stdio connection."))
-                        return
-                    header_lines.append(line)
-                    if line in (b"\r\n", b"\n", b""):
-                        break
+                if self.process.stdout is None:
+                    raise MCPError("The MCP bridge has no stdout stream.")
+                line = self.process.stdout.readline(8 * 1024 * 1024 + 1)
+                if not line:
+                    raise MCPError("The MCP bridge closed its output stream.")
+                if len(line) > 8 * 1024 * 1024:
+                    raise MCPError("The MCP response exceeds the example's size limit.")
+                message = json.loads(line.decode("utf-8"))
+                if not isinstance(message, dict):
+                    raise MCPError("Expected a JSON-RPC message object.")
+                if self.log:
+                    self.log.detail(f"RECV {json.dumps(message, ensure_ascii=False)}")
+                self.messages.put(message)
+        except (ValueError, OSError, MCPError) as error:
+            error_message = str(error)
+            if self.log:
+                self.log.error(f"STDOUT error: {error_message}")
+            self.messages.put(MCPError(error_message))
 
-                headers: Dict[str, str] = {}
-                for raw in header_lines:
-                    if raw in (b"\r\n", b"\n", b""):
-                        continue
-                    text = raw.decode("utf-8", errors="replace")
-                    if ":" not in text:
-                        continue
-                    name, value = text.split(":", 1)
-                    headers[name.strip().lower()] = value.strip()
-
-                content_length = headers.get("content-length")
-                if content_length is None:
-                    raw_all = b"".join(header_lines)
-                    try:
-                        self._message_queue.put(json.loads(raw_all.decode("utf-8", errors="replace")))
-                    except json.JSONDecodeError as exc:
-                        self._message_queue.put(PaintFEMCPError(f"Could not decode MCP JSON message: {raw_all!r}"))
-                    continue
-
-                size = int(content_length)
-                body = self.process.stdout.read(size)
-                if len(body) != size:
-                    self._message_queue.put(PaintFEMCPError("Unexpected end of MCP message body from PaintFE."))
-                    return
-                try:
-                    self._message_queue.put(json.loads(body.decode("utf-8", errors="replace")))
-                except json.JSONDecodeError as exc:
-                    self._message_queue.put(PaintFEMCPError(f"Could not decode MCP JSON payload: {body!r}"))
-        except Exception as exc:
-            self._message_queue.put(exc)
-
-    def _send_message(self, message: Dict[str, Any]) -> None:
-        if self.process is None or self.process.stdin is None:
-            raise PaintFEMCPError("MCP client is not connected to PaintFE.")
-
-        payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        if self.log:
-            self.log.detail(f"SEND {json.dumps(message, ensure_ascii=False)}")
-        header = f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
-        self.process.stdin.write(header + payload)
-        self.process.stdin.flush()
-
-    def _read_message(self, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
-        if self.process is None:
-            raise PaintFEMCPError("PaintFE stdio stream is not available.")
-        try:
-            item = self._message_queue.get(timeout=timeout_seconds)
-        except _queue.Empty:
-            if self.process.poll() is not None:
-                stderr_text = "\n".join(self.stderr_lines[-5:])
-                raise PaintFEMCPError(
-                    f"PaintFE exited unexpectedly while waiting for a response. "
-                    f"stderr: {stderr_text or 'no stderr output'}"
-                )
-            raise TimeoutError(
-                f"PaintFE is running (PID {self.process.pid}), but the MCP server did not respond "
-                f"within {timeout_seconds:.0f} seconds. "
-                "Open Preferences > AI and enable Local agent connections. "
-                "If connections are already enabled, check that the PaintFE window is open and not minimised."
-            )
-        if isinstance(item, BaseException):
-            raise item
-        if self.log:
-            self.log.detail(f"RECV {json.dumps(item, ensure_ascii=False)}")
-        return item
-
-    def request(self, method: str, params: Optional[Dict[str, Any]] = None, *, expect_response: bool = True, timeout_seconds: Optional[float] = TIMEOUT) -> Optional[Dict[str, Any]]:
-        request_id = self.next_id
-        self.next_id += 1
-
-        message = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params or {},
-        }
-        self._send_message(message)
-
-        if not expect_response:
-            return None
-
-        deadline = time.monotonic() + (timeout_seconds or TIMEOUT)
-        while True:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"PaintFE is running, but MCP method '{method}' did not respond within {timeout_seconds} seconds. "
-                    "Check Preferences > AI and enable Local agent connections, then ensure document editing is allowed."
-                )
-            response = self._read_message(timeout_seconds=max(0.1, deadline - time.monotonic()))
-            if response.get("id") == request_id:
-                if "error" in response:
-                    error = response["error"]
-                    message_text = error.get("message", "Unknown MCP error")
-                    raise PaintFEMCPError(f"PaintFE MCP error for {method}: {message_text}")
-                return response.get("result")
-
-            # Ignore unrelated notifications triggered by the server.
-
-    def notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
-        self._send_message({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-        })
-
-    def close(self) -> None:
-        if self.process is None:
+    def _read_stderr(self):
+        if self.process.stderr is None:
+            self.errors.append("The MCP bridge has no stderr stream.")
+            if self.log:
+                self.log.warning("The MCP bridge has no stderr stream.")
             return
         try:
-            if self.process.stdin:
-                self.process.stdin.close()
-        except Exception:
+            for line in self.process.stderr:
+                text = line.decode("utf-8", errors="replace").strip()[:2048]
+                if text:
+                    self.errors.append(text)
+                    if self.log:
+                        self.log.detail(f"STDERR {text}")
+        except OSError:
             pass
+
+    def send(self, message):
+        # MCP stdio is one UTF-8 JSON message per line, without headers.
+        payload = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+        if self.process.stdin is None:
+            raise MCPError("The MCP bridge has no stdin stream.")
+        if self.log:
+            self.log.detail(f"SEND {payload}")
         try:
-            self.process.terminate()
-            self.process.wait(timeout=3)
-        except Exception:
+            self.process.stdin.write(payload.encode("utf-8") + b"\n")
+            self.process.stdin.flush()
+        except OSError as error:
+            raise MCPError("Could not write to the MCP bridge.") from error
+
+    def request(self, method, params=None):
+        self.next_id += 1
+        request_id = self.next_id
+        self.send({"jsonrpc": "2.0", "id": request_id,
+                   "method": method, "params": params or {}})
+        deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MCPError(f"Timed out waiting for {method}; check the client framing and bridge process.")
             try:
+                response = self.messages.get(timeout=remaining)
+            except queue.Empty as error:
+                raise MCPError(f"Timed out waiting for {method}; check the client framing and bridge process.") from error
+            if isinstance(response, Exception):
+                detail = "\n".join(self.errors)
+                raise MCPError(str(response) + ("\n" + detail if detail else ""))
+            if response.get("id") != request_id:
+                continue  # Notifications do not complete a pending request.
+            if "error" in response:
+                raise MCPError(str(response["error"].get("message", response["error"])))
+            if "result" not in response:
+                raise MCPError("The JSON-RPC response has no result.")
+            return response["result"]
+
+    def connect(self):
+        if self.log:
+            self.log.info("Initializing PaintFE MCP connection")
+        result = self.request("initialize", {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "paintfe-python-example", "version": "1.0.0"},
+        })
+        if result.get("protocolVersion") != "2025-11-25":
+            raise MCPError("The server did not accept the requested protocol version.")
+        if self.log:
+            self.log.info("Sending notifications/initialized")
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        return self.request("tools/list")
+
+    def tool(self, name, arguments=None):
+        if self.log:
+            self.log.info(f"Calling tool {name} with arguments {json.dumps(arguments or {}, ensure_ascii=False)}")
+        result = self.request("tools/call", {"name": name, "arguments": arguments or {}})
+        text = "\n".join(item["text"] for item in result.get("content", [])
+                         if item.get("type") == "text")
+        if result.get("isError"):
+            raise MCPError(f"{name}: {text or 'tool execution failed'}")
+        if "structuredContent" in result:
+            if self.log:
+                self.log.detail(f"tool {name} structurally returned: {json.dumps(result['structuredContent'], ensure_ascii=False)}")
+            return result["structuredContent"]
+        try:
+            parsed = json.loads(text)
+            if self.log:
+                self.log.detail(f"tool {name} returned: {json.dumps(parsed, ensure_ascii=False)}")
+            return parsed
+        except ValueError as error:
+            raise MCPError(f"{name}: expected a JSON text result.") from error
+
+    def wait_for_job(self, timeout=60):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = self.tool("job_status")
+            if not isinstance(result, dict) or not isinstance(result.get("busy"), bool):
+                raise MCPError("job_status: missing boolean busy field.")
+            if not result["busy"]:
+                if result.get("status") != "Applied":
+                    raise MCPError("Drawing did not complete: " + str(result.get("status") or "no job result"))
+                if self.log:
+                    self.log.info("Job completed successfully.")
+                return result
+            time.sleep(0.1)
+        raise MCPError("Drawing is still running. Inspect job_status or use cancel before continuing.")
+
+    def close(self):
+        try:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+            self.process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            if self.process.poll() is None:
                 self.process.kill()
-            except Exception:
-                pass
+            self.process.wait(timeout=3)
         finally:
-            self.process = None
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    stream.close()
+            if self.log:
+                self.log.info("PaintFE MCP client closed.")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
-def parse_config(config_text: str) -> Tuple[str, List[str]]:
-    data = json.loads(config_text)
-    server = data.get("mcpServers", {}).get("paintfe", {})
-    command = server.get("command") or server.get("executable")
-    args = server.get("args") or []
-    if not command:
-        raise PaintFEMCPError("No `command` found in the PaintFE MCP config.")
-    return command, list(args)
+def current_document(client, document_id=None):
+    documents = client.tool("documents")
+    if not isinstance(documents, list):
+        raise MCPError("documents: expected a list.")
+    for document in documents:
+        if document_id is None or document.get("document") == document_id:
+            return document
+    raise MCPError("Open a document in PaintFE before continuing.")
 
 
-def normalize_tool_result(payload: Any) -> Any:
-    if isinstance(payload, dict):
-        if "structuredContent" in payload:
-            return payload["structuredContent"]
-        if "content" in payload:
-            content = payload["content"]
-            if isinstance(content, list):
-                parts: List[str] = []
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "text":
-                            text = item.get("text")
-                            if isinstance(text, str):
-                                try:
-                                    return json.loads(text)
-                                except json.JSONDecodeError:
-                                    parts.append(text)
-                        else:
-                            return item
-                if parts:
-                    return parts[0]
-            return content
-        return payload
-    return payload
+def target(document):
+    return {"document": document["document"], "layer": document["active_layer"],
+            "revision": document["revision"]}
 
 
-def get_documents(client: MCPStdioClient) -> List[Dict[str, Any]]:
-    raw = client.request("tools/call", {"name": "documents", "arguments": {}})
-    result = normalize_tool_result(raw)
-
-    if isinstance(result, dict) and "documents" in result:
-        docs = result["documents"]
-    elif isinstance(result, list):
-        docs = result
-    elif isinstance(result, dict):
-        docs = [result]
-    else:
-        raise PaintFEMCPError(f"Unexpected documents response: {result!r}")
-
-    if not isinstance(docs, list):
-        raise PaintFEMCPError(f"The documents tool did not return a list: {docs!r}")
-    return docs
-
-
-def pick_document_and_layer(doc: Dict[str, Any]) -> Tuple[str, str, int]:
-    document_id = doc.get("document") or doc.get("id") or doc.get("document_id")
-    if not document_id:
-        raise PaintFEMCPError(f"Could not find the document identifier in: {doc!r}")
-
-    layers = doc.get("layers") or doc.get("items") or []
-    layer = None
-
-    for entry in layers:
-        if not isinstance(entry, dict):
-            continue
-        kind = str(entry.get("type") or entry.get("kind") or entry.get("layerType") or "").lower()
-        if kind in {"raster", "bitmap", "image", "layer"} or "raster" in kind:
-            layer = entry
-            break
-        if entry.get("active") or entry.get("selected"):
-            layer = entry
-            break
-
-    if layer is None and layers:
-        layer = layers[0]
-
-    if layer is None:
-        raise PaintFEMCPError(f"No raster layer found in document {document_id!r}.")
-
-    layer_id = layer.get("id") or layer.get("layer") or layer.get("layer_id")
-    if not layer_id:
-        raise PaintFEMCPError(f"No layer identifier was found for document {document_id!r}.")
-
-    revision = doc.get("revision")
-    if revision is None:
-        revision = doc.get("current_revision") or doc.get("currentRevision") or doc.get("version")
-    if revision is None:
-        raise PaintFEMCPError(f"No revision number found for document {document_id!r}.")
-
-    return str(document_id), str(layer_id), int(revision)
+def draw_three_dots(client, document):
+    document_id = document["document"]
+    if client.log:
+        client.log.info(f"Creating example layer for document {document_id}")
+    client.tool("new_layer", {**target(document), "name": "MCP example"})
+    for fraction, colour in [(0.2, [255, 0, 0, 255]), (0.5, [0, 180, 0, 255]),
+                             (0.8, [0, 80, 255, 255])]:
+        document = current_document(client, document_id)
+        x = min(document["width"] - 1, int(document["width"] * fraction))
+        y = min(document["height"] - 1, int(document["height"] * fraction))
+        if client.log:
+            client.log.info(f"Drawing dot at ({x}, {y}) with colour {colour}")
+        result = client.tool("stroke", {**target(document), "points": [[x, y]],
+                                       "colour": colour, "size": 3, "pencil": True})
+        if result.get("queued") is not True:
+            raise MCPError("stroke: expected a queued operation.")
+        client.wait_for_job()
 
 
-def wait_for_job_completion(client: MCPStdioClient, timeout_seconds: float = 15.0) -> Any:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        raw = client.request("tools/call", {"name": "job_status", "arguments": {}})
-        status = normalize_tool_result(raw)
-
-        if isinstance(status, dict):
-            state = str(status.get("status") or status.get("state") or status.get("result") or "").lower()
-            if not state or "idle" in state or "done" in state or "completed" in state or "finished" in state:
-                return status
-            if "error" in state or "cancel" in state:
-                return status
-        elif isinstance(status, str):
-            state = status.lower()
-            if not state or "idle" in state or "done" in state or "completed" in state or "finished" in state:
-                return status
-            if "error" in state or "cancel" in state:
-                return status
-
-        time.sleep(0.25)
-
-    raise TimeoutError("PaintFE async job did not complete within the allowed time.")
-
-
-def connect_and_test_paintfe(config_text: str, log: Optional[RunLog] = None) -> int:
-    command, args = parse_config(config_text)
-    client = MCPStdioClient(command, args, log=log)
-
-    try:
-        if log:
-            log.info(f"Launching PaintFE: {command} {' '.join(args)}")
-        client.start()
-
-        if log:
-            log.info("Sending initialize handshake to MCP server")
-        client.request(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "paintfe-python-probe", "version": "1.0.0"},
-            },
-            timeout_seconds=TIMEOUT,
-        )
-        client.notification("notifications/initialized")
-
-        tool_list_result = client.request("tools/list", {})
-        tools = normalize_tool_result(tool_list_result)
-        if isinstance(tools, dict):
-            tool_names = [tool.get("name") for tool in tools.get("tools", []) if isinstance(tool, dict)]
-        elif isinstance(tools, list):
-            tool_names = [tool.get("name") if isinstance(tool, dict) else str(tool) for tool in tools]
-        else:
-            raise PaintFEMCPError(f"Unexpected result from tools/list: {tools!r}")
-
-        if not tool_names:
-            raise PaintFEMCPError("PaintFE returned no MCP tools. Enable local agent connections and try again.")
-
-        print("MCP connection OK.")
-        print(f"Available tools: {', '.join(tool_names)}") # pyright: ignore[reportArgumentType, reportCallIssue]
-        if log:
-            log.info(f"MCP connection OK. Available tools: {', '.join(tool_names)}") # pyright: ignore[reportCallIssue, reportArgumentType]
-
-        documents = get_documents(client)
-        if not documents:
-            raise PaintFEMCPError("There are no open PaintFE documents to edit.")
-
-        doc = documents[0]
-        document_id, layer_id, revision = pick_document_and_layer(doc)
-        print(f"Using document={document_id}, layer={layer_id}, revision={revision}")
-        if log:
-            log.info(f"Using document={document_id}, layer={layer_id}, revision={revision}")
-
-        if "activate_layer" in tool_names:
-            response = client.request(
-                "tools/call",
-                {"name": "activate_layer", "arguments": {"document": document_id, "layer": layer_id}},
-            )
-            print(f"activate_layer response: {normalize_tool_result(response)}")
-            if log:
-                log.info(f"activate_layer response: {normalize_tool_result(response)}")
-
-        width = int(doc.get("width") or doc.get("image_width") or 1024)
-        height = int(doc.get("height") or doc.get("image_height") or 768)
-
-        points = [
-            [(width * 0.15), (height * 0.20)],
-            [(width * 0.50), (height * 0.50)],
-            [(width * 0.80), (height * 0.80)],
-        ]
-        colors = [
-            [255, 0, 0, 255],
-            [0, 255, 0, 255],
-            [0, 0, 255, 255],
-        ]
-
-        for idx, (point, colour) in enumerate(zip(points, colors), start=1):
-            x, y = int(point[0]), int(point[1])
-            payload = {
-                "document": document_id,
-                "layer": layer_id,
-                "revision": revision,
-                "points": [[x, y]],
-                "colour": colour,
-                "size": 8,
-                "pencil": True,
-            }
-            print(f"Drawing dot #{idx} at ({x}, {y}) using colour {colour}...")
-            if log:
-                log.info(f"Drawing dot #{idx} at ({x}, {y}) using colour {colour}")
-            client.request("tools/call", {"name": "stroke", "arguments": payload})
-            wait_for_job_completion(client)
-
-            refreshed = get_documents(client)
-            if refreshed:
-                doc = refreshed[0]
-                document_id, layer_id, revision = pick_document_and_layer(doc)
-
-        print("Three test dots have been sent to PaintFE.")
-        print("Open the PaintFE window and it should show three colored dots in different positions.")
-        if log:
-            log.info("Three test dots have been sent to PaintFE.")
-        return 0
-
-    except Exception as exc:  # pragma: no cover - top-level CLI error path
-        stderr_text = "\n".join(client.stderr_lines[-20:])
-        if stderr_text and log:
-            log.error(f"PaintFE stderr: {stderr_text}")
-        elif stderr_text:
-            print(f"PaintFE stderr: {stderr_text}", file=sys.stderr)
-
-        if log:
-            log.error(f"Connection test failed: {exc}")
-        else:
-            print(f"Connection test failed: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        client.close()
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Check the PaintFE MCP stdio server and draw three test dots.")
-    parser.add_argument(
-        "--config",
-        default=json.dumps(DEFAULT_CONFIG, separators=(",", ":")),
-        help="JSON string with the PaintFE MCP server config (default: the example from the docs).",
-    )
-    parser.add_argument(
-        "--command",
-        help="Override the PaintFE executable path. Use only if you do not want to rely on the JSON config.",
-    )
-    parser.add_argument(
-        "--arg",
-        action="append",
-        dest="args",
-        default=[],
-        help="Extra argument to pass to PaintFE (for example --mcp). Can be used more than once.",
-    )
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--paintfe", required=True, type=Path, help="Path to the PaintFE executable")
+    parser.add_argument("--draw", action="store_true", help="Create a layer and draw three test dots")
+    parser.add_argument("--timeout", type=float, default=20, help="Response timeout in seconds (default: 20)")
     args = parser.parse_args()
-
-    config_text = args.config
-    if args.command:
-        if not args.args:
-            args.args = ["--mcp"]
-        config_text = json.dumps({"mcpServers": {"paintfe": {"command": args.command, "args": args.args}}}, separators=(",", ":"))
-
+    if not math.isfinite(args.timeout) or not 0 < args.timeout <= 120:
+        parser.error("--timeout must be greater than zero and at most 120 seconds")
     with RunLog(LOG_DIR) as log:
-        log.info(f"Starting PaintFE MCP probe with config: {config_text}")
-        return connect_and_test_paintfe(config_text, log=log)
+        try:
+            log.info(f"Starting PaintFE MCP example with executable: {args.paintfe}")
+            with Client(args.paintfe, timeout=args.timeout, log=log) as client:
+                tools = client.connect()
+                print(f"Connected. {len(tools['tools'])} tools available.")
+                log.info(f"Connected. {len(tools['tools'])} tools available.")
+                document = current_document(client)
+                print(f"Document: {document['name']} ({document['width']} x {document['height']})")
+                log.info(f"Document: {document['name']} ({document['width']} x {document['height']})")
+                if args.draw:
+                    draw_three_dots(client, document)
+                    print("Three dots added to the MCP example layer. Review in PaintFE; nothing was saved.")
+                    log.info("Three dots added to the MCP example layer. Review in PaintFE; nothing was saved.")
+                else:
+                    print("Read-only check complete. Use --draw to add a separate layer with three test dots.")
+                    log.info("Read-only check complete. Use --draw to add a separate layer with three test dots.")
+            return 0
+        except (OSError, MCPError) as error:
+            message = f"MCP example: {error}"
+            log.error(message)
+            return 1
 
 
 if __name__ == "__main__":
