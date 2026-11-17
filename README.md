@@ -2,6 +2,8 @@
 
 This repository shows how to use PaintFE as a local MCP server. PaintFE is a graphics editor that can accept commands from an external AI client through the Model Context Protocol (MCP).
 
+![Dog as drawn by MiniMax 3.1 Flash](output/dog_minimax_31flash.png)
+
 ## What MCP means in PaintFE
 
 PaintFE can expose a local MCP server for an external agent. The protocol uses JSON-RPC over stdio (stdin/stdout), so this is a local stdio server rather than an HTTP service.
@@ -94,6 +96,33 @@ The script launches `PaintFE.exe --mcp` as a child process. In this mode, the ap
 
 > Important: PaintFE in `--mcp` mode does not respond to JSON-RPC requests until Local agent connections are enabled in Preferences > AI. If the script times out after "Sending initialize handshake to MCP server", open PaintFE manually, go to Preferences > AI, enable Local agent connections, and then rerun the script.
 
+## Drawing a dog 256x256 image by AI models
+
+The only good result I've received so far is the one below, made by MiniMax 3.1 Flash (18M tokens spent (17.6 cached), took about 3 hours). Other models tested (DeepSeek 4.1 Flash, Qwen 3.8 Flash, GLM 5.3 Flash, ChatGPT 6 Luna) all gave results that were far from good (but they spent way less time and tockens) -- resuls are present in [output\dog.pfe](output\dog.pfe) file.
+
+### MiniMax 3.1 Flash
+
+![Dog as drawn by MiniMax 3.1 Flash](output/dog_minimax_31flash.png)
+
+`paintfe_dog_minimax_31flash.py` uses the same MCP client but paints a stylised dog into a 256x256 document:
+
+```bash
+python paintfe_dog_minimax_31flash.py
+```
+
+Options:
+
+| Flag | Purpose |
+| --- | --- |
+| `--paintfe` | Path to the PaintFE executable |
+| `--layer` | Name of the new artwork layer (default `MCP dog`) |
+| `--doc` | Name of the open document to draw on (default: a 256x256 document) |
+| `--no-draw` | Only inspect the document |
+| `--no-preview` | Do not save the PNG preview |
+| `--preview-path` | Where the PNG preview is written (default `output/dog-preview.png`) |
+
+The artwork is authored in a 256x256 design space and scaled to the open document, so it lands exactly on a 256x256 canvas. It is rasterised in Python and sent as pencil strokes, because the MCP brush in PaintFE 1.5.0 only paints the rim of a stroke — the automation path never rebuilds the brush alpha lookup table for the requested size, so the interior of every dab stays empty. The pencil path uses Bresenham's algorithm and writes exact pixels.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -107,7 +136,4 @@ The script launches `PaintFE.exe --mcp` as a child process. In this mode, the ap
 
 - [docs/automation.md](docs/automation.md) — technical documentation for MCP PaintFE
 - [paintfe_mcp_test.py](paintfe_mcp_test.py) — example client for checking the connection and drawing test points
-
-## Note
-
-This project does not automatically connect PaintFE to external AI services. All data stays local. If a remote model provider is used, its client may receive document previews, but PaintFE itself does not upload the document unless the user chooses to do so.
+- [paintfe_dog_minimax_31flash.py](paintfe_dog_minimax_31flash.py) — draws a dog into a 256x256 document over the same client
