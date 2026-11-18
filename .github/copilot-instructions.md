@@ -44,7 +44,6 @@ Before editing, always:
 - Do not attempt mask editing or text-layer operations through this toolset.
 - Respect the supported image limits and coordinate system.
 - Keep commands limited to valid document pixels and supported parameter values.
-- Use `pencil: true` with `size: 1` for anything that must be pixel-exact. The default brush path is unusable for fills (see the bug section below).
 - Clip every point to `0 <= x < width` and `0 <= y < height` before sending; `stroke` rejects any point outside the canvas.
 - Remember that each applied stroke or shape is its own undo entry, so clean-up after a mistake needs that many `undo` calls.
 
@@ -109,58 +108,6 @@ Practical details that saved time:
 - Hiding layers is a temporary convenience, not a finished state: a document left with
   several `opacity: 0` layers looks broken to the user, because `documents` still
   reports them as `"visible": true`.
-
-## Known bug: the MCP brush paints only the stroke rim (issue draft)
-
-**Title:** Automation `stroke` with the brush renders only the outline of the dab; the interior is never filled
-
-**Environment:** PaintFE 1.5.0, Windows, MCP over stdio, document `dog.pfe`
-(256x256, 8-bit RGBA raster layer), pencil flag `false`, size `15`.
-
-**Summary:** A brush stroke requested through the MCP `stroke` tool paints a hollow
-outline instead of a filled band. Only the outer edge of each dab is written, so the
-stroke looks like a 1 px contour of the intended shape.
-
-**Steps to reproduce:**
-
-1. Open a 256x256 document, enable Preferences > AI > local agent connections and
-   document editing.
-2. Call `documents` and read `document`, `active_layer`, `revision`.
-3. `new_layer` with name `ZZ brush probe`.
-4. `stroke` with `points: [[60, 40], [140, 40]]`, `colour: [255, 0, 255, 255]`,
-   `size: 15`, `pencil: false`.
-5. Poll `job_status` until `busy: false`, `status: "Applied"`.
-6. Call `preview` and inspect the pixels.
-
-**Expected:** a filled capsule about 15 px tall and 95 px wide, i.e. roughly 1,200
-magenta pixels, with rows 33-47 solid between x=60 and x=140.
-
-**Actual:** only 20 magenta pixels exist in the whole area. They sit on the upper and
-lower rim of the capsule (3, 3, 2, 1, 1 pixels on rows 32-36 and 1, 1, 2, 3, 3 pixels
-on rows 43-47), the end caps are hollow arcs, and rows 37-42 are completely empty.
-The sampled interior region (rows 35-45, x=75-125) is 0 of 550 pixels filled, i.e.
-**0% of the stroke body is painted**. The saved screenshot is
-`logs/probe-brush-stroke.png`.
-
-**Impact:** the brush path cannot be used for any fill, silhouette or thick line. Every
-agent that needs a solid image must work around it by rasterising offline and sending
-dense `pencil: true`, `size: 1` strokes, which is far slower and pushes more data.
-
-**Suspected cause (needs confirming against the tagged source):** the automation
-stroke path builds the dab without rebuilding the brush alpha lookup table for the
-requested size, so the LUT stays zeroed and only the outermost fraction of a pixel
-band receives alpha. The interactive brush path is unaffected.
-
-**Suggested fix:** initialise or rebuild the brush alpha LUT for the requested size
-before `render_automation_stroke` dabs, mirroring the interactive brush code.
-
-**Suggested regression test:** draw one stroke of size 15 over a known rectangle,
-read back the pixels, and assert that the interior sample block (for example rows
-35-45, x=75-125) is fully covered in the requested colour. A rim-only render must fail
-the test.
-
-**Workaround:** use `pencil: true` with `size: 1` and send integer pixel chains, as
-described in the drawing approach above.
 
 ## Good practice examples
 
